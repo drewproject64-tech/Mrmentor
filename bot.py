@@ -6,6 +6,8 @@ import re
 import sqlite3
 import time
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -18,6 +20,15 @@ GOAL = "Set a Goal"
 DAILY = "Daily Action"
 PROGRESS = "My Progress"
 DONE = "Mark today complete"
+COMMANDS = {
+    "start": "Open the main menu",
+    "help": "See how to use Mr Mentor",
+    "goal": "Set a weekly goal",
+    "daily": "Get today's action",
+    "progress": "View this week's progress",
+    "cancel": "Cancel goal setup",
+}
+COMMAND_ACTIONS = {"/goal": GOAL, "/daily": DAILY, "/progress": PROGRESS}
 ACTIONS = {
     "Study": (
         "Review your notes and write down three points you want to remember.",
@@ -102,9 +113,16 @@ def initialize(db):
 
 def handle(db, chat_id, text, today):
     week = (today - timedelta(days=today.weekday())).isoformat()
-    if text.split(maxsplit=1)[:1] == ["/start"]:
+    if text.startswith("/"):
+        command = text.split(maxsplit=1)[0].partition("@")[0].lower()
+        text = COMMAND_ACTIONS.get(command, command)
+    if text in ("/start", "/help"):
         db.execute("DELETE FROM goal_setup WHERE chat_id = ?", (chat_id,))
-        return "Welcome to Mr Mentor. Set a weekly goal, take a daily action, and track your progress.", MENU
+        return (
+            "Welcome to Mr Mentor. Use /goal to set a weekly target, /daily to get "
+            "today's action, and /progress to see how many days you've completed.",
+            MENU,
+        )
 
     if text == GOAL:
         db.execute("REPLACE INTO goal_setup VALUES (?, NULL)", (chat_id,))
@@ -113,6 +131,10 @@ def handle(db, chat_id, text, today):
     if text == "/cancel":
         db.execute("DELETE FROM goal_setup WHERE chat_id = ?", (chat_id,))
         return "Goal setup closed.", MENU
+
+    if text.startswith("/"):
+        db.execute("DELETE FROM goal_setup WHERE chat_id = ?", (chat_id,))
+        return "Use /help to see the available commands.", MENU
 
     goal = db.execute(
         "SELECT category, target FROM goals WHERE chat_id = ? AND week = ?",
@@ -164,28 +186,55 @@ def handle(db, chat_id, text, today):
     return f"Weekly goal saved\n{text}\n\nTap Daily Action for today's step.", MENU
 
 
-def run():
-    token = os.environ.get("BOT_TOKEN", "")
-    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
-        raise SystemExit("Set BOT_TOKEN to the token provided by BotFather.")
+def start_health_server(port, last_poll):
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/health"):
+                self.send_error(404)
+                return
+            ready = time.monotonic() - last_poll[0] < 90
+            self.send_response(200 if ready else 503)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK\n" if ready else b"Telegram polling unavailable\n")
 
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    logging.info("Health server listening on port %s", port)
+    return server
+
+
+def poll(token, last_poll):
     offset = 0
+    initialized = False
     profile_steps = [
         ("setMyName", {"name": "Mr Mentor"}),
         ("setMyDescription", {"description": DESCRIPTION}),
         ("setMyShortDescription", {"short_description": ABOUT}),
+        ("setMyCommands", {
+            "commands": [
+                {"command": name, "description": description}
+                for name, description in COMMANDS.items()
+            ],
+        }),
     ]
+    retry_profile_at = 0
     with sqlite3.connect(os.environ.get("BOT_DB_PATH", "mrmentor.sqlite3")) as db:
         initialize(db)
         while True:
             try:
-                while profile_steps:
-                    method, fields = profile_steps[0]
-                    telegram_call(token, method, **fields)
-                    profile_steps.pop(0)
+                if not initialized:
+                    identity = telegram_call(token, "getMe")
+                    telegram_call(token, "deleteWebhook", drop_pending_updates=False)
+                    logging.info("Starting Telegram polling for @%s", identity["username"])
+                    initialized = True
                 updates = telegram_call(
-                    token, "getUpdates", offset=offset, timeout=30, allowed_updates=["message"]
+                    token, "getUpdates", offset=offset, timeout=20, allowed_updates=["message"]
                 )
+                last_poll[0] = time.monotonic()
                 for update in updates:
                     message = update.get("message", {})
                     chat = message.get("chat", {})
@@ -203,6 +252,34 @@ def run():
             except TelegramError as error:
                 logging.warning("%s. Retrying in five seconds.", error)
                 time.sleep(5)
+                continue
+
+            if profile_steps and time.monotonic() >= retry_profile_at:
+                method, fields = profile_steps.pop(0)
+                try:
+                    telegram_call(token, method, **fields)
+                except TelegramError as error:
+                    logging.warning("%s. Profile setup will retry while the bot keeps polling.", error)
+                    profile_steps.append((method, fields))
+                    retry_profile_at = time.monotonic() + 60
+
+
+def run():
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token):
+        raise SystemExit("Set BOT_TOKEN to the token provided by BotFather.")
+
+    last_poll = [float("-inf")]
+    port = os.environ.get("PORT")
+    if not port:
+        poll(token, last_poll)
+        return
+
+    with start_health_server(int(port), last_poll) as server:
+        try:
+            poll(token, last_poll)
+        finally:
+            server.shutdown()
 
 
 if __name__ == "__main__":
